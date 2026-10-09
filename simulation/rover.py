@@ -15,7 +15,6 @@ class Rover:
         self.home_vector = HomeVector()
         self.mode = "EXPLORE"
 
-        # Obstacle avoidance
         self.avoiding_obstacle = False
         self.turn_direction = 1.0
         self.avoidance_steps = 0
@@ -26,11 +25,14 @@ class Rover:
         self.heading_tolerance = 0.12
         self.home_radius = 0.05
 
-        # Stuck detection
         self.max_avoidance_steps = 50
         self.last_position = (x, y)
         self.no_progress_steps = 0
         self.progress_epsilon = 0.05
+
+        # Near-home recovery settings.
+        self.home_approach_radius = 0.6
+        self.home_approach_threshold = 0.25
 
     def return_home(self):
         self.mode = "RETURN_HOME"
@@ -48,7 +50,6 @@ class Rover:
         return obstacle["distance"]
 
     def _choose_turn_direction(self, world):
-        # Compare free space on both sides of the rover.
         left_heading = normalize_angle(
             self.heading + math.radians(45)
         )
@@ -69,20 +70,30 @@ class Rover:
         if right_clearance > left_clearance:
             return -1.0
 
-        # Deterministic tie-breaker.
         return self.turn_direction
+
+    def _home_heading(self):
+        return math.atan2(-self.y, -self.x)
+
+    def _clear_toward_home(self, world):
+        """Check whether the sensor cone toward home is clear."""
+        home_heading = self._home_heading()
+        distance = self._distance_at_heading(world, home_heading)
+
+        return distance >= self.home_approach_threshold
 
     def step(self, world, dt=0.1):
         if dt <= 0:
             raise ValueError("dt must be positive")
 
-        # Stop when the rover reaches home.
-        actual_home_distance = math.hypot(self.x, self.y)
+        distance_home = math.hypot(self.x, self.y)
 
         if (
             self.mode == "RETURN_HOME"
-            and actual_home_distance <= self.home_radius
+            and distance_home <= self.home_radius
         ):
+            self.avoiding_obstacle = False
+            self.avoidance_steps = 0
             return None, MotionCommand(
                 speed=0.0,
                 turn_rate=0.0,
@@ -100,7 +111,40 @@ class Rover:
             else world.max_sensor_range
         )
 
-        # Start avoiding an obstacle when it enters the danger zone.
+        near_home = (
+            self.mode == "RETURN_HOME"
+            and distance_home <= self.home_approach_radius
+        )
+
+        # Close to home, prioritize a safe direct approach when possible.
+        if near_home and self._clear_toward_home(world):
+            self.avoiding_obstacle = False
+            self.avoidance_steps = 0
+
+            target_heading = self._home_heading()
+            heading_error = normalize_angle(
+                target_heading - self.heading
+            )
+
+            if abs(heading_error) > self.heading_tolerance:
+                command = MotionCommand(
+                    speed=0.0,
+                    turn_rate=math.copysign(
+                        self.turn_rate,
+                        heading_error,
+                    ),
+                )
+            else:
+                command = MotionCommand(
+                    speed=0.35,
+                    turn_rate=0.0,
+                )
+
+            self._integrate(command, dt)
+            self._update_progress()
+            return obstacle, command
+
+        # Normal obstacle detection.
         if (
             not self.avoiding_obstacle
             and obstacle_distance < self.obstacle_threshold
@@ -109,7 +153,6 @@ class Rover:
             self.avoidance_steps = 0
             self.turn_direction = self._choose_turn_direction(world)
 
-        # Continue turning until the path has adequate clearance.
         if self.avoiding_obstacle:
             self.avoidance_steps += 1
 
@@ -120,7 +163,6 @@ class Rover:
 
             else:
                 if self.avoidance_steps >= self.max_avoidance_steps:
-                    # Re-evaluate the safer direction after prolonged turning.
                     self.turn_direction = self._choose_turn_direction(world)
                     self.avoidance_steps = 0
 
@@ -133,10 +175,8 @@ class Rover:
                 self._update_progress()
                 return obstacle, command
 
-        # Navigate toward home when the path is clear.
         if self.mode == "RETURN_HOME":
-            target_heading = self.home_vector.direction_home()
-
+            target_heading = self._home_heading()
             heading_error = normalize_angle(
                 target_heading - self.heading
             )
@@ -154,7 +194,6 @@ class Rover:
                     speed=0.7,
                     turn_rate=0.0,
                 )
-
         else:
             command = MotionCommand(
                 speed=1.0,
